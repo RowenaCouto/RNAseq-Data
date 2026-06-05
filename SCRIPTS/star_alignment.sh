@@ -40,3 +40,4 @@ ${INPUT_DIR}/Liver-CTRL-2_S2_L001_R2_001_val_2.fq.gz \
 --outSAMtype BAM SortedByCoordinate
 
 echo "DONE STAR alignment"
+
