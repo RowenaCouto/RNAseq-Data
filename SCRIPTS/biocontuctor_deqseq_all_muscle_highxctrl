@@ -1,0 +1,223 @@
+cd /scratch/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633
+
+install.packages("BiocManager")
+
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+BiocManager::install("DESeq2")
+library(DESeq2)
+## 1) Listar arquivos de contagem
+## Seus arquivos terminam com: _Star_Aligned.out.bam_all.txt
+files <- list.files(".", pattern="Star_Aligned.out.bam_all.txt")
+
+## Verificar se encontrou os 9 arquivos
+print(files)
+print(length(files))
+
+## 4) Ler cada arquivo e extrair apenas a coluna de counts
+## featureCounts gera 7 colunas:
+## Geneid | Chr | Start | End | Strand | Length | counts
+## A última coluna é sempre o count da amostra
+cts <- lapply(files, function(f) {
+  x <- read.table(f, header=TRUE, row.names=1)
+  x[, ncol(x), drop=FALSE]   # mantém só a coluna de counts
+})
+####ver colunas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", ncol(cts[[i]]), " colunas\n", sep = "")
+}
+###ver nome das col;unas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", colnames(cts[[i]]), "\n", sep = "")
+}
+
+## 5) Combinar todas as colunas de counts em uma matriz
+cts <- do.call(cbind, cts)
+
+## 6) Nomear colunas com o nome da amostra (removendo o sufixo do arquivo)
+colnames(cts) <- gsub("_Star_Aligned.out.bam_all.txt", "", files)
+
+## Conferir estrutura final
+colnames(cts)
+head(cts)
+
+###############################################
+## 7) Criar colData automaticamente pelo nome ##
+###############################################
+
+sample_names <- colnames(cts)
+
+## condition
+
+condition <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
+         ifelse(grepl("LOW",  sample_names, ignore.case=TRUE), "LOW",
+         ifelse(grepl("HIGH", sample_names, ignore.case=TRUE), "HIGH", NA)))
+
+condition
+table(condition)
+
+## tissue
+tissue <- ifelse(grepl("Adipose", sample_names), "Adipose",
+          ifelse(grepl("Duodenum", sample_names), "Duodenum",
+          ifelse(grepl("Kidney", sample_names), "Kidney",
+          ifelse(grepl("Liver", sample_names), "Liver",
+          ifelse(grepl("Muscle", sample_names), "Muscle", NA)))))
+
+tissue
+table(tissue)
+
+#type
+type <- rep("paired-end", length(sample_names))
+type <- factor(type)
+
+#colData
+colData <- data.frame(
+  row.names = sample_names,
+  condition = factor(condition, levels = c("CTRL","HIGH")),
+  tissue    = factor(tissue),
+  type = type
+)
+
+colData$condition <- factor(colData$condition)
+colData$type <- factor(colData$type)
+
+
+print(colData)
+all(rownames(colData) == colnames(cts))
+#########################################
+## 8) Criar objeto DESeq2 e rodar DESeq ##
+#########################################
+
+## Aqui você NÃO define contrastes.
+## Aqui você só ajusta o modelo estatístico.
+## O DESeq() prepara tudo para os contrastes,
+## mas não calcula log2FC ainda.
+
+dds_global <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData = colData,
+  design = ~ condition
+)
+
+dds_global <- estimateSizeFactors(dds_global)
+
+##Subset por tecido
+dds_muscle <- dds_global[, dds_global$tissue == "Muscle"]
+
+#Prefiltrar genes (≥10 counts em ≥3 amostras)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds_muscle) >= 10) >= smallestGroupSize
+dds_muscle <- dds_muscle[keep, ]
+dds_muscle
+
+######Note on factor leves/Relevel#####
+dds_muscle$condition <- relevel(dds_muscle$condition, ref = "CTRL")
+
+#Rodar DESeq no subset
+dds_muscle <- DESeq(dds_muscle)
+
+dds_muscle
+mcols(dds_muscle)
+
+## 9) Extrair resultados dos dois contrastes do seu estudo ##
+###########################################################
+
+## Aqui SIM você define os contrastes explicitamente.
+
+## LOW vs CTRL
+res_low <- results(dds_muscle, contrast = c("condition", "LOW", "CTRL"))
+res_low
+
+## HIGH vs CTRL
+res_high <- results(dds_muscle, contrast = c("condition", "HIGH", "CTRL"))
+res_high
+
+####Shrink#######################################################
+install.packages("ashr")
+
+resultsNames(dds_muscle)
+
+res_high_lfc <- lfcShrink(
+  dds_muscle,
+  coef = "condition_HIGH_vs_CTRL",
+  type = "ashr"
+)
+res_high_lfc
+
+res_low_lfc <- lfcShrink(
+  dds_muscle,
+  coef = "condition_LOW_vs_CTRL",
+  type = "ashr"
+)
+res_low_lfc
+
+#Normalized counts
+norm_counts <- counts(dds_muscle, normalized = TRUE)
+
+norm_counts_df <- data.frame(
+  gene = rownames(norm_counts),
+  norm_counts
+)
+
+write.csv(
+  norm_counts_df,
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle/normalizedcounts_muscle_highxctrl2.csv",
+  row.names = FALSE
+)
+
+head(read.csv("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle/normalizedcounts_muscle_highxctrl2.csv"))
+
+###
+summary(res_high_lfc)
+sum(res_high_lfc$padj < 0.1, na.rm=TRUE)
+
+# IDs originais (com versão)
+ids_original <- rownames(res_high_lfc)
+
+# IDs sem versão (para mapIds)
+ids_clean <- gsub("\\..*", "", ids_original)
+
+#Mapear símbolos usando os IDs limpos
+symbols <- mapIds(
+  org.Mm.eg.db,
+  keys = ids_clean,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+#Adicionar símbolo ao seu resultado shrink sem alterar o ID original
+res_high_lfc$symbol <- symbols
+
+#remover genes symbolo (NA)
+res_high_lfc_filtered <- res_high_lfc[!is.na(res_high_lfc$symbol), ]
+
+#ordenar por padj
+res_high_lfc_ordered <- res_high_lfc[order(res_high_lfc$padj), ]
+
+#salvar
+write.csv(
+  as.data.frame(res_high_lfc_ordered),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle/allgenes_muscle_highxctrl2nd.csv",
+  row.names = TRUE
+)
+
+# Criar versão filtrada para significantes
+res_high_lfc_sig <- res_high_lfc_ordered
+
+# Remover padj NA (somente para significantes)
+res_high_lfc_sig <- res_high_lfc_sig[!is.na(res_high_lfc_sig$padj), ]
+
+# Filtrar significantes
+sig_high <- res_high_lfc_sig[res_high_lfc_sig$padj < 0.05, ]
+
+# Já está ordenado, porque veio de res_high_lfc_ordered
+# Mas se quiser garantir:
+sig_high <- sig_high[order(sig_high$padj), ]
+
+write.csv(
+  as.data.frame(sig_high),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle/significantgenes_muscle_highxctrl2nd2.csv",
+  row.names = TRUE
+)

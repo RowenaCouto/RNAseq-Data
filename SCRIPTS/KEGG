@@ -1,0 +1,88 @@
+####### KEGG ANALYSIS ####
+.libPaths("/group/sbms006/rrubimsilvadocouto/KEGG_analysis/R_libs")
+
+assign(".lib.loc", "/mmfs1/data/group/sbms006/rrubimsilvadocouto/KEGG_analysis/R_libs", envir = environment(.libPaths))
+
+.libPaths()
+
+#### r/4.5.0 ##
+
+install.packages("BiocManager")
+BiocManager::install(version = "3.22")
+library(BiocManager)
+
+BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+
+install.packages("ggplot2")
+library(ggplot2)
+
+BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+BiocManager::install("org.Mm.eg.db")
+library(org.Mm.eg.db)
+
+BiocManager::install("enrichplot")
+library(enrichplot)
+
+muscle_up <- read.csv("muscle_10_common_up_genes.csv")
+getwd()
+
+### Extrair os gene symbols ###
+colnames(muscle_up)
+### resposta [1] "Myh2"
+genesymbols <- muscle_up$Myh2
+head(genesymbols)
+
+### Map gene symbol to Entrez IDs ####
+
+entrez_ids <- mapIds(
+  org.Mm.eg.db,
+  keys = genesymbols,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+entrez_ids <- na.omit(entrez_ids) ## to remove NA values (unmapped genes)
+entrez_ids
+
+## write mapped genes, in case not all are mapped, e mandar o .csv para a pasta desejada ####
+ write.csv(entrez_ids, "/group/sbms006/rrubimsilvadocouto/KEGG_analysis/muscle/muscle_10_common_up_genes_kegg_mapped_genes.csv")
+
+
+######## perform KEGG enrichment analysis ## RPT RPT RPT ####
+kegg_enrichment <- enrichKEGG(
+    gene            = entrez_ids,     # use entrez ids
+    organism        = "mmu",          # mouse
+    pvalueCutoff    = 0.1,            # adjusted p-value cutoff
+    qvalueCutoff    = 1               # q-value cutoff
+)
+
+# save results and send to desired folder 
+
+write.csv(
+    as.data.frame(kegg_enrichment),
+    "/group/sbms006/rrubimsilvadocouto/KEGG_analysis/muscle/muscle_10_common_up_genes_kegg_enrichment_results.csv",
+    row.names = FALSE # to remove first column
+)
+
+# visualize results 
+
+
+pdf(
+    file = "/group/sbms006/rrubimsilvadocouto/KEGG_analysis/muscle/muscle_10_common_up_genes_kegg_enrichment_results.pdf",
+    width = 12,
+    height = 8
+)
+
+barplot(
+    kegg_enrichment,
+    showCategory = 20,
+    title = "Top Up-regulated Muscle Genes KEGG Pathways"
+)
+
+dev.off()
+
+

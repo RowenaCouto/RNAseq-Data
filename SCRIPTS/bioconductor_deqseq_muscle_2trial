@@ -1,22 +1,11 @@
 install.packages("BiocManager")
-BiocManager::install("DESeq2")
 
-library(AnnotationDbi)
 library(org.Mm.eg.db)
-library(DESeq2)
-library(ggplot2)
+library(AnnotationDbi)
 
+BiocManager::install("DESeq2")
+library(DESeq2)
 ## 1) Listar arquivos de contagem
-files <- c("Liver-CTRL-1_Star_Aligned.out.bam_all.txt
-Liver-CTRL-2_Star_Aligned.out.bam_all.txt
-Liver-CTRL-3_Star_Aligned.out.bam_all.txt
-Liver-HIGH-DOSE-CBD-1_Star_Aligned.out.bam_all.txt
-Liver-HIGH-DOSE-CBD-2_Star_Aligned.out.bam_all.txt
-Liver-HIGH-DOSE-CBD-3_Star_Aligned.out.bam_all.txt
-Liver-LOW-DOSE-CBD-1_Star_Aligned.out.bam_all.txt
-Liver-LOW-DOSE-CBD-2_Star_Aligned.out.bam_all.txt
-Liver-LOW-DOSE-CBD-3_Star_Aligned.out.bam_all.txt"
-)
 ## Seus arquivos terminam com: _Star_Aligned.out.bam_all.txt
 files <- list.files(".", pattern="Star_Aligned.out.bam_all.txt")
 
@@ -28,38 +17,59 @@ print(length(files))
 ## featureCounts gera 7 colunas:
 ## Geneid | Chr | Start | End | Strand | Length | counts
 ## A última coluna é sempre o count da amostra
-counts_list <- lapply(files, function(f) {
+cts <- lapply(files, function(f) {
   x <- read.table(f, header=TRUE, row.names=1)
   x[, ncol(x), drop=FALSE]   # mantém só a coluna de counts
 })
+####ver colunas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", ncol(cts[[i]]), " colunas\n", sep = "")
+}
+###ver nome das col;unas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", colnames(cts[[i]]), "\n", sep = "")
+}
 
 ## 5) Combinar todas as colunas de counts em uma matriz
-counts <- do.call(cbind, counts_list)
+cts <- do.call(cbind, cts)
 
 ## 6) Nomear colunas com o nome da amostra (removendo o sufixo do arquivo)
-colnames(counts) <- gsub("_Star_Aligned.out.bam_all.txt", "", files)
+colnames(cts) <- gsub("_Star_Aligned.out.bam_all.txt", "", files)
 
 ## Conferir estrutura final
-colnames(counts)
-head(counts)
+colnames(cts)
+head(cts)
 
 ###############################################
 ## 7) Criar colData automaticamente pelo nome ##
 ###############################################
 
-sample_names <- colnames(counts)
+sample_names <- colnames(cts)
 
-
-group <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
+condition <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
          ifelse(grepl("LOW",  sample_names, ignore.case=TRUE), "LOW",
          ifelse(grepl("HIGH", sample_names, ignore.case=TRUE), "HIGH", NA)))
 
+condition
+table(condition)
+
+type <- rep("paired-end", length(sample_names))
+type <- factor(type)
+
+
 colData <- data.frame(
   row.names = sample_names,
-  group = factor(group, levels=c("CTRL","LOW","HIGH"))
+  condition = factor(condition, levels = c("CTRL","LOW","HIGH")),
+  type = type
 )
 
+colData$condition <- factor(colData$condition)
+colData$type <- factor(colData$type)
+
+
+
 print(colData)
+all(rownames(colData) == colnames(cts))
 #########################################
 ## 8) Criar objeto DESeq2 e rodar DESeq ##
 #########################################
@@ -69,33 +79,68 @@ print(colData)
 ## O DESeq() prepara tudo para os contrastes,
 ## mas não calcula log2FC ainda.
 
-dds <- DESeqDataSetFromMatrix(
-  countData = counts,
+dds <- DESeqDataSetFromMatrix(countData = cts,
   colData = colData,
-  design = ~ group
+  design = ~ condition
 )
 
 dds <- DESeq(dds)
+dds
+mcols(dds)
 
-###########################################################
+########Pre-Filtering##################################################
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep, ]
+dds
+
+######Note on facotr leves#####
+dds$condition <- relevel(dds$condition, ref = "CTRL")
+dds <- DESeq(dds)
+
 ## 9) Extrair resultados dos dois contrastes do seu estudo ##
 ###########################################################
 
 ## Aqui SIM você define os contrastes explicitamente.
 ## LOW vs CTRL
-res_low <- results(dds, contrast=c("group","LOW","CTRL"))
-
+res_low <- results(dds, contrast=c("condition","LOW","CTRL"))
+res_low
 ## HIGH vs CTRL
-res_high <- results(dds, contrast=c("group","HIGH","CTRL"))
-###########################################################
-## 10) Normalizar counts igual ao artigo (log2 normalized) ##
-###########################################################
+res_high <- results(dds, contrast=c("condition","HIGH","CTRL"))
+res_high
 
-## Normalização por tamanho de biblioteca (DESeq2)
-norm <- counts(dds, normalized=TRUE)
 
-## Log2 transform igual ao paper
-norm_counts <- log2(norm + 1)
+####Shrink#######################################################
+resultsNames(dds)
+
+res_high_lfc <- lfcShrink(
+  dds,
+  coef = "condition_HIGH_vs_CTRL",
+  type = "apeglm"
+)
+
+res_high_lfc
+
+res_low_lfc <- lfcShrink(
+  dds,
+  coef = "condition_LOW_vs_CTRL",
+  type = "apeglm"
+)
+
+res_low_lfc
+
+norm_counts <- counts(dds, normalized = TRUE)
+norm_counts_df <- data.frame(gene = rownames(norm_counts), norm_counts)
+write.csv(
+  norm_counts_df,
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/muscle_normalized_counts.csv",
+  row.names = FALSE
+)
+
+
+ head(read.csv("muscle_normalized_counts.csv"))
+
+
 
 ###############################################################
 ## 11) DIFERENTIAL com symbol, ensembl sem versão e User_ID com versão
@@ -199,7 +244,7 @@ final <- rbind(final_main, final_mid, final_low)
 ## Salvar
 write.csv(
   final,
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_DIFFERENTIAL.csv",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/adipose-tissue_all/Adipose-Tissue_DIFFERENTIAL.csv",
   row.names = FALSE
 )
 
@@ -218,11 +263,13 @@ padj_low <- df$LOW_vs_CTRL_adjPval
 lfc_high  <- df$HIGH_vs_CTRL_log2FC
 padj_high <- df$HIGH_vs_CTRL_adjPval
 
-## Função para classificar regulacao
+## Função atualizada
 regulation_call <- function(lfc, padj) {
   if (is.na(padj)) {
     return("None")
   } else if (padj >= 0.05) {
+    return("None")
+  } else if (abs(lfc) < 1) {   # <---- filtro novo
     return("None")
   } else if (lfc > 0) {
     return("Up")
@@ -249,9 +296,10 @@ regulation <- data.frame(
 ## Salvar a aba REGULATION
 write.csv(
   regulation,
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_REGULATION2.csv",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_REGULATION_log2.csv",
   row.names = FALSE
 )
+
 
 
 ###############################################################
@@ -272,10 +320,13 @@ padj_low <- df$LOW_vs_CTRL_adjPval
 lfc_high  <- df$HIGH_vs_CTRL_log2FC
 padj_high <- df$HIGH_vs_CTRL_adjPval
 
+## Função atualizada novamente
 regulation_call <- function(lfc, padj) {
   if (is.na(padj)) {
     return("None")
   } else if (padj >= 0.05) {
+    return("None")
+  } else if (abs(lfc) < 1) {   # <---- filtro novo
     return("None")
   } else if (lfc > 0) {
     return("Up")
@@ -337,13 +388,11 @@ venn_df <- rbind(block1, block2, block3, block4, block5, block6)
 ## Salvar
 write.csv(
   venn_df,
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_VENN2.csv",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_VENN_log2.csv",
   row.names = FALSE
 )
 
-#################################
-##########VENN GRAPH#############
-#################################
+########################## VENN DIAGRAM #####################
 
 install.packages("VennDiagram")
 library(VennDiagram)
@@ -356,7 +405,7 @@ D <- HIGH_UP       # 100mg_UP
 
 ## Criar arquivo PNG
 png(
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_VENN_plot2.png",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_VENN_plot_log2.png",
   width = 6000,
   height = 4000,
   res = 300
@@ -396,7 +445,10 @@ draw.quad.venn(
 )
 
 dev.off()
-############################################
+
+###############################################
+############## BAR PLOT#######################
+###############################################
 
 library(ggplot2)
 
@@ -409,11 +461,13 @@ padj_low <- df$LOW_vs_CTRL_adjPval
 lfc_high  <- df$HIGH_vs_CTRL_log2FC
 padj_high <- df$HIGH_vs_CTRL_adjPval
 
-## Classificação igual à sua pipeline
+## Função atualizada novamente
 regulation_call <- function(lfc, padj) {
   if (is.na(padj)) {
     return("None")
   } else if (padj >= 0.05) {
+    return("None")
+  } else if (abs(lfc) < 1) {   # <---- filtro novo
     return("None")
   } else if (lfc > 0) {
     return("Up")
@@ -447,34 +501,10 @@ color_down <- "#5C6BC0"   # light blue/purple
 
 plot_df$Color <- ifelse(plot_df$Type == "UP", color_up, color_down)
 
-## Bar plot
-ggplot(plot_df, aes(x = Treatment, y = Count, fill = Color)) +
-  geom_bar(stat = "identity", color = "black") +
-  geom_text(aes(label = Count), vjust = -0.5, size = 6) +
-  scale_fill_identity() +
-  theme_minimal(base_size = 16) +
-  labs(
-    title = "Number of Differentially Expressed Genes",
-    x = "",
-    y = "Number of Genes"
-  ) +
-  theme(
-    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
-    axis.text.x = element_text(size = 14, angle = 20, hjust = 1)
-  )
-png(
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_BarPlot.png",
-  width = 3000,
-  height = 2500,
-  res = 300
-)
-
-## seu ggplot aqui
-
-dev.off()
+############# Bar plot########################
 
 png(
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_BarPlot.png",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_BarPlot_log2.png",
   width = 3000,
   height = 2500,
   res = 300
@@ -497,6 +527,9 @@ ggplot(plot_df, aes(x = Treatment, y = Count, fill = Color)) +
 
 dev.off()
 
+##################################
+## PCA PLOT #####################
+#################################
 
 library(ggplot2)
 
@@ -528,10 +561,10 @@ color_high <- "#D4A017"     # mostarda
 
 ## Plot PCA
 p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
-  geom_point(size = 6) +                     # sem nomes
+  geom_point(size = 6) +
   theme_minimal(base_size = 16) +
   labs(
-    title = "Liver PCA",
+    title = "Muscle PCA",
     x = paste0("PC1 (", round(summary(pca)$importance[2,1] * 100, 1), "% variance)"),
     y = paste0("PC2 (", round(summary(pca)$importance[2,2] * 100, 1), "% variance)")
   ) +
@@ -540,15 +573,15 @@ p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
     "20 mg/kg b.w." = color_low,
     "100 mg/kg b.w." = color_high
   )) +
-  coord_cartesian(xlim = c(-30, 30), ylim = c(-30, 30)) +
   theme(
     plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
     legend.title = element_blank(),
     legend.text = element_text(size = 14)
   )
 
+
 png(
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_PCA.png",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_PCA.png",
   width = 3000,
   height = 2500,
   res = 300
@@ -558,8 +591,9 @@ print(p)
 
 dev.off()
 
+
 ####################################################################
-##### 100mg/kg VOLCANO PLOT ##################
+##### HIGH VOLCANO PLOT ##################
 ###############################################################
 library(ggplot2)
 
@@ -580,8 +614,8 @@ padj <- padj[lfc > -50 & lfc < 50]
 neglog10 <- -log10(padj)
 
 ## Classificação
-reg <- ifelse(padj < 0.05 & lfc > 0, "Up-regulated",
-       ifelse(padj < 0.05 & lfc < 0, "Down-regulated",
+reg <- ifelse(padj < 0.05 & lfc > 1, "Up-regulated",
+       ifelse(padj < 0.05 & lfc < -1, "Down-regulated",
               "Not significant"))
 
 volcano_df <- data.frame(
@@ -604,7 +638,7 @@ p <- ggplot(volcano_df, aes(x = lfc, y = neglog10, color = reg)) +
   )) +
   theme_minimal(base_size = 16) +
   labs(
-    title = "Liver Volcano Plot",
+    title = "Muscle Volcano Plot",
     subtitle = "CBD 100 mg/kg b.w. × CTRL",
     x = "log2 Fold Change",
     y = "-log10(padj)"
@@ -618,15 +652,76 @@ p <- ggplot(volcano_df, aes(x = lfc, y = neglog10, color = reg)) +
   )
 ############SALVAR A IMAGEM###########
 png(
-  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/liver_all/Liver_HighVolcanoPlot.png",
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/muscle_all/Muscle_HighVolcanoPlot.png",
   width = 3000,
   height = 2500,
   res = 300
 )
 print(p)
 dev.off()
-#########################LOW
+#########################LOW VOLCANO PLOT ########################
+library(ggplot2)
 
+## Use SEMPRE o objeto res_low do DESeq2
+df <- as.data.frame(res_low)
+
+## Remover NA corretamente
+df <- df[!is.na(df$log2FoldChange) & !is.na(df$padj), ]
+
+## Criar colunas
+df$lfc      <- df$log2FoldChange
+df$padj     <- df$padj
+df$neglog10 <- -log10(df$padj)
+
+## Classificação
+df$reg <- ifelse(
+  df$padj < 0.05 & df$lfc > 0, "Up-regulated",
+  ifelse(df$padj < 0.05 & df$lfc < 0, "Down-regulated",
+         "Not significant")
+)
+
+## FORÇAR categorias a existirem na legenda
+df$reg <- factor(df$reg,
+                 levels = c("Up-regulated", "Down-regulated", "Not significant"))
+
+## Cores
+colors <- c(
+  "Up-regulated"   = "#C2185B",
+  "Down-regulated" = "#5C6BC0",
+  "Not significant" = "grey60"
+)
+
+## Volcano plot
+p <- ggplot(df, aes(x = lfc, y = neglog10, color = reg)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = colors, drop = FALSE) +   # <--- mantém azul na legenda
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Volcano Plot — LOW vs CTRL",
+    subtitle = "CBD 20 mg/kg b.w. × CTRL",
+    x = "log2 Fold Change",
+    y = "-log10(padj)"
+  ) +
+  coord_cartesian(
+    ylim = c(0, max(df$neglog10, na.rm = TRUE))          # <--- mostra padj=1 (y=0)
+  ) +
+  theme(
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 16, hjust = 0.5),
+    legend.title = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 14)
+  )
+
+## Salvar
+png(
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/genecount_all/adipose-tissue_all/Adipose-Tissue_LowVolcanoPlot.png",
+  width = 3000,
+  height = 2500,
+  res = 300
+)
+print(p)
+dev.off()
 
 
 
