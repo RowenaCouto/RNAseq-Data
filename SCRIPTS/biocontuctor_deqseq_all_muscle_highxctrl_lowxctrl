@@ -1,0 +1,965 @@
+cd /scratch/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633
+module load Anaconda3
+module load gcc
+module list
+conda activate rna_env
+module load r/4.4.2
+R
+
+install.packages("BiocManager")
+
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+BiocManager::install("DESeq2")
+library(DESeq2)
+## 1) Listar arquivos de contagem
+## Seus arquivos terminam com: _Star_Aligned.out.bam_all.txt
+files_all <- list.files(".", pattern="Star_Aligned.out.bam_all.txt")
+files_high <- files_all[!grepl("LOW", files_all)]
+
+## Verificar se encontrou os 9 arquivos
+print(files_high)
+print(length(files_high))
+
+## 4) Ler cada arquivo e extrair apenas a coluna de counts
+## featureCounts gera 7 colunas:
+## Geneid | Chr | Start | End | Strand | Length | counts
+## A última coluna é sempre o count da amostra
+cts_high <- lapply(files_high, function(f) {
+  x <- read.table(f, header=TRUE, row.names=1)
+  x[, ncol(x), drop=FALSE]   # mantém só a coluna de counts
+})
+####ver colunas
+for (i in seq_along(cts_high)) {
+  cat(files_high[i], ": ", ncol(cts_high[[i]]), " colunas\n", sep = "")
+}
+###ver nome das col;unas
+for (i in seq_along(cts_high)) {
+  cat(files_high[i], ": ", colnames(cts_high[[i]]), "\n", sep = "")
+}
+
+## 5) Combinar todas as colunas de counts em uma matriz
+cts_high <- do.call(cbind, cts_high)
+
+## 6) Nomear colunas com o nome da amostra (removendo o sufixo do arquivo)
+colnames(cts_high) <- gsub("_Star_Aligned.out.bam_all.txt", "", files_high)
+
+## Conferir estrutura final
+colnames(cts_high)
+head(cts_high)
+
+###############################################
+## 7) Criar colData automaticamente pelo nome ##
+###############################################
+
+sample_names <- colnames(cts_high)
+
+## condition
+
+condition <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
+         ifelse(grepl("LOW",  sample_names, ignore.case=TRUE), "LOW",
+         ifelse(grepl("HIGH", sample_names, ignore.case=TRUE), "HIGH", NA)))
+
+condition
+table(condition)
+
+## tissue
+tissue <- ifelse(grepl("Adipose", sample_names), "Adipose",
+          ifelse(grepl("Duodenum", sample_names), "Duodenum",
+          ifelse(grepl("Kidney", sample_names), "Kidney",
+          ifelse(grepl("Liver", sample_names), "Liver",
+          ifelse(grepl("Muscle", sample_names), "Muscle", NA)))))
+
+tissue
+table(tissue)
+
+#type
+type <- rep("paired-end", length(sample_names))
+type <- factor(type)
+
+#colData
+colData_high <- data.frame(
+  row.names = sample_names,
+  condition = factor(condition, levels = c("CTRL","HIGH")),
+  tissue    = factor(tissue),
+  type = type
+)
+
+colData_high$condition <- factor(colData_high$condition)
+colData_high$type <- factor(colData_high$type)
+
+
+print(colData_high)
+all(rownames(colData_high) == colnames(cts_high))
+#########################################
+## 8) Criar objeto DESeq2 e rodar DESeq ##
+#########################################
+
+## Aqui você NÃO define contrastes.
+## Aqui você só ajusta o modelo estatístico.
+## O DESeq() prepara tudo para os contrastes,
+## mas não calcula log2FC ainda.
+
+dds_global_high <- DESeqDataSetFromMatrix(
+  countData = cts_high,
+  colData = colData_high,
+  design = ~ condition
+)
+
+dds_global_high <- estimateSizeFactors(dds_global_high)
+
+##Subset por tecido
+dds_muscle_high <- dds_global_high[, dds_global_high$tissue == "Muscle"]
+
+#Prefiltrar genes (≥10 counts em ≥3 amostras)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds_muscle_high) >= 10) >= smallestGroupSize
+dds_muscle_high <- dds_muscle_high[keep, ]
+dds_muscle_high
+
+######Note on factor leves/Relevel#####
+dds_muscle_high$condition <- relevel(dds_muscle_high$condition, ref = "CTRL")
+
+#Rodar DESeq no subset
+dds_muscle_high <- DESeq(dds_muscle_high)
+
+dds_muscle_high
+mcols(dds_muscle_high)
+
+## 9) Extrair resultados dos dois contrastes do seu estudo ##
+###########################################################
+
+## Aqui SIM você define os contrastes explicitamente.
+
+## HIGH vs CTRL
+res_high <- results(dds_muscle_high, contrast = c("condition", "HIGH", "CTRL"))
+res_high
+
+####Shrink#######################################################
+install.packages("ashr")
+
+resultsNames(dds_muscle_high)
+
+res_high_lfc <- lfcShrink(
+  dds_muscle_high,
+  coef = "condition_HIGH_vs_CTRL",
+  type = "ashr"
+)
+res_high_lfc
+
+###
+summary(res_high_lfc)
+length(res_high_lfc)
+
+sum(res_high_lfc$padj < 0.1, na.rm=TRUE)
+
+#Normalized counts
+norm_counts_high <- counts(dds_muscle_high, normalized = TRUE)
+
+norm_counts_high_df <- data.frame(
+  gene = rownames(norm_counts_high),
+  norm_counts_high
+)
+
+write.csv(
+  norm_counts_high_df,
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/normalizedcounts_muscle_highxctrl.csv",
+  row.names = FALSE
+)
+
+head(read.csv("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/normalizedcounts_muscle_highxctrl.csv"))
+
+# IDs originais (com versão)
+ids_original_high <- rownames(res_high_lfc)
+
+# IDs sem versão (para mapIds)
+ids_clean_high <- gsub("\\..*", "", ids_original_high)
+
+#Mapear símbolos usando os IDs limpos
+symbols <- mapIds(
+  org.Mm.eg.db,
+  keys = ids_clean_high,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+#Adicionar símbolo ao seu resultado shrink sem alterar o ID original
+res_high_lfc$symbol <- symbols
+
+#remover genes symbolo (NA)
+res_high_lfc_ordered <- res_high_lfc[!is.na(res_high_lfc$symbol), ]
+
+#ordenar por padj
+res_high_lfc_ordered <- res_high_lfc_ordered[order(res_high_lfc_ordered$padj), ]
+
+#salvar
+write.csv(
+  as.data.frame(res_high_lfc_ordered),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/allgenes_muscle_highxctrl10.csv",
+  row.names = TRUE
+)
+
+# Criar versão filtrada para significantes
+res_high_lfc_sig <- res_high_lfc_ordered
+
+# Remover padj NA (somente para significantes)
+res_high_lfc_sig <- res_high_lfc_sig[!is.na(res_high_lfc_sig$padj), ]
+
+# Filtrar significantes
+sig_high <- res_high_lfc_sig[res_high_lfc_sig$padj < 0.05, ]
+
+# Já está ordenado, porque veio de res_high_lfc_ordered
+# Mas se quiser garantir:
+sig_high <- sig_high[order(sig_high$padj), ]
+
+write.csv(
+  as.data.frame(sig_high),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/significantgenes_muscle_highxctrl2.csv",
+  row.names = TRUE
+)
+
+### LOW ######
+
+files <- list.files(".", pattern="Star_Aligned.out.bam_all.txt")
+files_low <- files[!grepl("HIGH", files)]
+
+print(files_low)
+print(length(files_low))
+
+
+## 4) Ler cada arquivo e extrair apenas a coluna de counts
+## featureCounts gera 7 colunas:
+## Geneid | Chr | Start | End | Strand | Length | counts
+## A última coluna é sempre o count da amostra
+cts_low <- lapply(files_low, function(f) {
+  x <- read.table(f, header=TRUE, row.names=1)
+  x[, ncol(x), drop=FALSE]
+})
+#### Ver colunas
+for (i in seq_along(cts_low)) {
+  cat(files_low[i], ": ", ncol(cts_low[[i]]), " colunas\n", sep = "")
+}
+
+### Ver nome das colunas
+for (i in seq_along(cts_low)) {
+  cat(files_low[i], ": ", colnames(cts_low[[i]]), "\n", sep = "")
+}
+
+## 5) Combinar todas as colunas de counts em uma matriz
+cts_low <- do.call(cbind, cts_low)
+
+## 6) Nomear colunas com o nome da amostra
+colnames(cts_low) <- gsub("_Star_Aligned.out.bam_all.txt", "", files_low)
+
+## Conferir estrutura final
+colnames(cts_low)
+head(cts_low)
+
+###############################################
+## 7) Criar colData automaticamente pelo nome ##
+###############################################
+
+sample_names <- colnames(cts_low)
+
+## condition
+
+condition <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
+         ifelse(grepl("LOW",  sample_names, ignore.case=TRUE), "LOW",
+         ifelse(grepl("HIGH", sample_names, ignore.case=TRUE), "HIGH", NA)))
+
+condition
+table(condition)
+
+## tissue
+tissue <- ifelse(grepl("Adipose", sample_names), "Adipose",
+          ifelse(grepl("Duodenum", sample_names), "Duodenum",
+          ifelse(grepl("Kidney", sample_names), "Kidney",
+          ifelse(grepl("Liver", sample_names), "Liver",
+          ifelse(grepl("Muscle", sample_names), "Muscle", NA)))))
+
+tissue
+table(tissue)
+
+#type
+type <- rep("paired-end", length(sample_names))
+type <- factor(type)
+
+#colData
+colData_low <- data.frame(
+  row.names = sample_names,
+  condition = factor(condition, levels = c("CTRL","LOW")),
+  tissue    = factor(tissue),
+  type = type
+)
+
+colData_low$condition <- factor(colData_low$condition)
+colData_low$type <- factor(colData_low$type)
+
+
+print(colData_low)
+all(rownames(colData_low) == colnames(cts_low))
+#########################################
+## 8) Criar objeto DESeq2 e rodar DESeq ##
+#########################################
+
+## Aqui você NÃO define contrastes.
+## Aqui você só ajusta o modelo estatístico.
+## O DESeq() prepara tudo para os contrastes,
+## mas não calcula log2FC ainda.
+
+dds_global_low <- DESeqDataSetFromMatrix(
+  countData = cts_low,
+  colData = colData_low,
+  design = ~ condition
+)
+
+dds_global_low <- estimateSizeFactors(dds_global_low)
+
+##Subset por tecido
+dds_muscle_low <- dds_global_low[, dds_global_low$tissue == "Muscle"]
+
+#Prefiltrar genes (≥10 counts em ≥3 amostras)
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds_muscle_low) >= 10) >= smallestGroupSize
+dds_muscle_low <- dds_muscle_low[keep, ]
+dds_muscle_low
+
+######Note on factor leves/Relevel#####
+dds_muscle_low$condition <- relevel(dds_muscle_low$condition, ref = "CTRL")
+
+#Rodar DESeq no subset
+dds_muscle_low <- DESeq(dds_muscle_low)
+
+dds_muscle_low
+mcols(dds_muscle_low)
+
+## 9) Extrair resultados dos dois contrastes do seu estudo ##
+###########################################################
+
+## Aqui SIM você define os contrastes explicitamente.
+
+## LOW vs CTRL
+res_low <- results(dds_muscle_low, contrast = c("condition", "LOW", "CTRL"))
+res_low
+
+####Shrink#######################################################
+
+resultsNames(dds_muscle_low)
+
+
+res_low_lfc <- lfcShrink(
+  dds_muscle_low,
+  coef = "condition_LOW_vs_CTRL",
+  type = "ashr"
+)
+res_low_lfc
+
+###
+summary(res_low_lfc)
+sum(res_high_lfc$padj < 0.1, na.rm=TRUE)
+
+#Normalized counts
+norm_counts_low <- counts(dds_muscle_low, normalized = TRUE)
+
+norm_counts_df_low <- data.frame(
+  gene = rownames(norm_counts_low),
+  norm_counts_low
+)
+
+write.csv(
+  norm_counts_df_low,
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/normalizedcounts_muscle_lowxctrl.csv",
+  row.names = FALSE
+)
+
+head(read.csv("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/normalizedcounts_muscle_lowxctrl.csv"))
+
+# IDs originais (com versão)
+ids_original_low <- rownames(res_low_lfc)
+
+# IDs sem versão (para mapIds)
+ids_clean_low <- gsub("\\..*", "", ids_original_low)
+
+#Mapear símbolos usando os IDs limpos
+symbols <- mapIds(
+  org.Mm.eg.db,
+  keys = ids_clean_low,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+#Adicionar símbolo ao seu resultado shrink sem alterar o ID original
+res_low_lfc$symbol <- symbols
+
+#remover genes symbolo (NA)
+res_low_lfc_filtered <- res_low_lfc[!is.na(res_low_lfc$symbol), ]
+
+#ordenar por padj
+res_low_lfc_ordered <- res_low_lfc_filtered[order(res_low_lfc_filtered$padj), ]
+
+#salvar
+write.csv(
+  as.data.frame(res_low_lfc_ordered),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/allgenes_muscle_lowxctrl.csv",
+  row.names = TRUE
+)
+
+# Criar versão filtrada para significantes
+res_low_lfc_sig <- res_low_lfc_ordered
+
+# Remover padj NA (somente para significantes)
+res_low_lfc_sig <- res_low_lfc_sig[!is.na(res_low_lfc_sig$padj), ]
+
+# REMOVER símbolo NA
+res_low_lfc_sig <- res_low_lfc_sig[!is.na(res_low_lfc_sig$symbol), ]
+
+# Filtrar significantes
+sig_low <- res_low_lfc_sig[res_low_lfc_sig$padj < 0.05, ]
+
+# Já está ordenado, porque veio de res_high_lfc_ordered
+# Mas se quiser garantir:
+sig_low <- sig_low[order(sig_low$padj), ]
+
+write.csv(
+  as.data.frame(sig_low),
+  file = "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/significantgenes_muscle_lowxctrl.csv",
+  row.names = TRUE
+)
+
+#### PCA PLOTS #####
+ 
+## PCA HIGH ###
+vsd_high <- vst(dds_muscle_high, blind = FALSE)
+
+plotPCA(vsd_high, intgroup = c("condition", "type"))
+
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/PCA_muscle_high.png",
+    width = 3000, height = 2500, res = 300)
+
+plotPCA(vsd_high, intgroup = c("condition", "type"))
+
+dev.off()
+
+## PCA LOW ##
+vsd_low <- vst(dds_muscle_low, blind = FALSE)
+
+plotPCA(vsd_low, intgroup = c("condition", "type"))
+
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/PCA_muscle_low.png",
+    width = 3000, height = 2500, res = 300)
+
+plotPCA(vsd_low, intgroup = c("condition", "type"))
+
+dev.off()
+
+#### PCA global ####
+files <- list.files(".", pattern="Star_Aligned.out.bam_all.txt")
+print(files)
+print(length(files))
+
+## 4) Ler cada arquivo e extrair apenas a coluna de counts
+## featureCounts gera 7 colunas:
+## Geneid | Chr | Start | End | Strand | Length | counts
+## A última coluna é sempre o count da amostra
+cts <- lapply(files, function(f) {
+  x <- read.table(f, header=TRUE, row.names=1)
+  x[, ncol(x), drop=FALSE]   # mantém só a coluna de counts
+})
+####ver colunas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", ncol(cts[[i]]), " colunas\n", sep = "")
+}
+###ver nome das col;unas
+for (i in seq_along(cts)) {
+  cat(files[i], ": ", colnames(cts[[i]]), "\n", sep = "")
+}
+
+## 5) Combinar todas as colunas de counts em uma matriz
+cts <- do.call(cbind, cts)
+
+## 6) Nomear colunas com o nome da amostra (removendo o sufixo do arquivo)
+colnames(cts) <- gsub("_Star_Aligned.out.bam_all.txt", "", files)
+
+## Conferir estrutura final
+colnames(cts)
+head(cts)
+
+###############################################
+## 7) Criar colData automaticamente pelo nome ##
+###############################################
+
+sample_names <- colnames(cts)
+
+## condition
+
+condition <- ifelse(grepl("CTRL", sample_names, ignore.case=TRUE), "CTRL",
+         ifelse(grepl("LOW",  sample_names, ignore.case=TRUE), "LOW",
+         ifelse(grepl("HIGH", sample_names, ignore.case=TRUE), "HIGH", NA)))
+
+condition
+table(condition)
+
+## tissue
+tissue <- ifelse(grepl("Adipose", sample_names), "Adipose",
+          ifelse(grepl("Duodenum", sample_names), "Duodenum",
+          ifelse(grepl("Kidney", sample_names), "Kidney",
+          ifelse(grepl("Liver", sample_names), "Liver",
+          ifelse(grepl("Muscle", sample_names), "Muscle", NA)))))
+
+tissue
+table(tissue)
+
+#type
+type <- rep("paired-end", length(sample_names))
+type <- factor(type)
+
+#colData
+colData <- data.frame(
+  row.names = sample_names,
+  condition = factor(condition, levels = c("CTRL","LOW","HIGH")),
+  tissue    = factor(tissue),
+  type = type
+)
+
+colData$condition <- factor(colData$condition)
+colData$type <- factor(colData$type)
+
+print(colData)
+all(rownames(colData) == colnames(cts))
+#########################################
+## 8) Criar objeto DESeq2 e rodar DESeq ##
+#########################################
+
+## Aqui você NÃO define contrastes.
+## Aqui você só ajusta o modelo estatístico.
+## O DESeq() prepara tudo para os contrastes,
+## mas não calcula log2FC ainda.
+
+dds_global <- DESeqDataSetFromMatrix(
+  countData = cts,
+  colData = colData,
+  design = ~ condition
+)
+
+dds_global <- estimateSizeFactors(dds_global)
+
+##Subset por tecido
+dds_muscle <- dds_global[, dds_global$tissue == "Muscle"]
+
+## rodar Deqseq global
+#Rodar DESeq no subset
+dds_muscle <- DESeq(dds_muscle)
+
+dds_muscle
+
+## PCA plot ##
+vsd_muscle <- vst(dds_muscle, blind = FALSE)
+
+plotPCA(vsd_muscle, intgroup = c("condition", "type"))
+
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/PCA_muscle_global.png",
+    width = 3000, height = 2500, res = 300)
+
+plotPCA(vsd_muscle, intgroup = c("condition", "type"))
+
+dev.off()
+
+## VOLCANO PLOT ###
+  BiocManager::install('EnhancedVolcano')
+    library(EnhancedVolcano)
+library(EnhancedVolcano)
+
+
+## HIGH VOLCANO PLOT ###
+
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/volcano_muscle_highxctrl.png",
+    width = 3000, height = 2500, res = 300)
+
+EnhancedVolcano(
+  res_high_lfc,
+  lab = res_high_lfc$symbol,
+  x = 'log2FoldChange',
+  y = 'padj',
+  pCutoff = 0.05,      # <<<<<< padj cutoff
+  FCcutoff = 1,        # <<<<<< log2FC cutoff
+  pointSize = 2.0,
+  labSize = 3.5
+)
+
+dev.off()
+
+## LOW VOLCANO PLOT ###
+
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/volcano_muscle_lowxctrl.png",
+    width = 3000, height = 2500, res = 300)
+
+EnhancedVolcano(
+  res_low_lfc,
+  lab = res_low_lfc$symbol,
+  x = 'log2FoldChange',
+  y = 'padj',
+  pCutoff = 0.05,      # padj cutoff
+  FCcutoff = 1,        # log2FC cutoff
+  pointSize = 2.0,
+  labSize = 3.5
+)
+
+dev.off()
+
+## VENN DIAGRAM ##
+# HIGH x CTRL #
+# Primeiro: transformar sua lista em vetor de nomes #
+sig_high_vec <- rownames(sig_high)
+
+# Segundo: filtrar por log2FC ≥ 1 usando o vetor #
+sig_high_log2fc <- sig_high_vec[
+  abs(res_high_lfc[sig_high_vec, "log2FoldChange"]) >= 1
+]
+
+# LOW x CTRL #
+# Primeiro: transformar sua lista em vetor de nomes #
+sig_low_vec <- rownames(sig_low)
+
+# Segundo: filtrar por log2FC ≥ 1 usando o vetor #
+sig_low_log2fc <- sig_low_vec[
+  abs(res_low_lfc[sig_low_vec, "log2FoldChange"]) >= 1
+]
+
+# Conferir
+length(sig_high_log2fc)
+length(sig_low_log2fc)
+
+## criar UP and DOWN ##
+# HIGH #
+
+sig_high_up <- sig_high_vec[
+  res_high_lfc[sig_high_vec, "log2FoldChange"] >= 1
+]
+
+sig_high_down <- sig_high_vec[
+  res_high_lfc[sig_high_vec, "log2FoldChange"] <= -1
+]
+
+# LOW #
+sig_low_up <- sig_low_vec[
+  res_low_lfc[sig_low_vec, "log2FoldChange"] >= 1
+]
+
+sig_low_down <- sig_low_vec[
+  res_low_lfc[sig_low_vec, "log2FoldChange"] <= -1
+]
+
+###
+library(VennDiagram)
+library(grid)
+
+vd4 <- venn.diagram(
+  x = list(
+    HIGH_UP   = sig_high_up,
+    HIGH_DOWN = sig_high_down,
+    LOW_UP    = sig_low_up,
+    LOW_DOWN  = sig_low_down
+  ),
+  filename = NULL,
+  fill = c("red", "blue", "green", "yellow"),
+  alpha = 0.5,
+  cex = 2.0,
+  cat.cex = 1.5,
+  main.cex = 2.0,
+  cat.pos = c(-20, 20, 0, 0),
+  cat.dist = c(0.20, 0.20, 0.11, 0.11),
+  margin = 0.03,
+  main = "Muscle: HIGH vs LOW - UP & DOWN (log2FC >= 1)"
+)
+
+grid.draw(vd4)
+
+###### SALVAR VENN
+png("/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/venn4_muscle_high_low_up_down7.png",
+    width = 3500, height = 3000, res = 300)
+
+grid.draw(vd4)
+
+dev.off()
+
+
+
+## KEGG PATHWAY - requires r/4.5.0 ##
+#check data#
+nrow(sig_high)
+colnames(sig_high)
+nrow(sig_low)
+colnames(sig_low)
+##
+save.image("muscle_deqseq_bioconductor.RData")
+
+#### r/4.5.0 ##
+module unload r/4.4.2
+module load r/4.5.0
+R
+
+load("muscle_deqseq_bioconductor.RData")
+
+####### KEGG ANALYSIS ####
+.libPaths("/group/sbms006/rrubimsilvadocouto/KEGG_analysis/R_libs")
+
+assign(".lib.loc", "/mmfs1/data/group/sbms006/rrubimsilvadocouto/KEGG_analysis/R_libs", envir = environment(.libPaths))
+
+#biblioteca de arquivos#
+.libPaths()
+
+#diretorio de trabalho#
+getwd()
+
+install.packages("BiocManager")
+BiocManager::install(version = "3.22")
+library(BiocManager)
+
+BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+
+install.packages("ggplot2")
+library(ggplot2)
+
+BiocManager::install("org.Mm.eg.db")
+library(org.Mm.eg.db)
+
+BiocManager::install("enrichplot")
+library(enrichplot)
+
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+BiocManager::install("DESeq2")
+library(DESeq2)
+
+#check high data#
+colnames(sig_high)
+head(sig_high)
+nrow(sig_high)
+length(sig_high)
+
+#check low data#
+colnames(sig_low)
+head(sig_low)
+nrow(sig_low)
+length(sig_low)
+
+# criar vetor único de todos genes significantes, não apenas separado por UP/DOWN.
+#remover NAs#
+sig_high_clean <- sig_high[!is.na(sig_high$padj) & !is.na(sig_high$log2FoldChange), ]
+sig_low_clean  <- sig_low[!is.na(sig_low$padj) & !is.na(sig_low$log2FoldChange), ]
+
+# HIGH and LOW (padj < 0.05, log2FC > 1)
+## HIGH — ALL
+high_all <- sig_high_clean$symbol[
+  sig_high_clean$padj < 0.05 &
+  abs(sig_high_clean$log2FoldChange) > 1
+]
+
+## HIGH — UP
+high_up <- sig_high_clean$symbol[
+  sig_high_clean$padj < 0.05 &
+  sig_high_clean$log2FoldChange > 1
+]
+
+## HIGH — DOWN
+high_down <- sig_high_clean$symbol[
+  sig_high_clean$padj < 0.05 &
+  sig_high_clean$log2FoldChange < -1
+]
+
+### Extrair gene symbols#
+genesymbols_high_all  <- high_all
+genesymbols_high_up   <- high_up
+genesymbols_high_down <- high_down
+
+## LOW — ALL
+low_all <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  abs(sig_low_clean$log2FoldChange) > 1
+]
+
+## LOW — UP
+low_up <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  sig_low_clean$log2FoldChange > 1
+]
+
+## LOW — DOWN
+low_down <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  sig_low_clean$log2FoldChange < -1
+]
+
+### Extrair gene symbols#
+genesymbols_low_all  <- low_all
+genesymbols_low_up   <- low_up
+genesymbols_low_down <- low_down
+
+#intersect
+inter_all  <- intersect(high_all,  low_all)
+inter_up   <- intersect(high_up,   low_up)
+inter_down <- intersect(high_down, low_down)
+
+### Extrair gene symbols#
+genesymbols_inter_all  <- inter_all
+genesymbols_inter_up   <- inter_up
+genesymbols_inter_down <- inter_down
+
+### Map gene symbol to Entrez IDs ####
+# high all#
+entrez_ids_high_all <- mapIds(
+  org.Mm.eg.db,
+  keys = genesymbols_high_all,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+entrez_ids_high_all <- na.omit(entrez_ids_high_all)
+
+#high_up#
+entrez_ids_high_up <- mapIds(
+  org.Mm.eg.db,
+  keys = genesymbols_high_up,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+entrez_ids_high_up <- na.omit(entrez_ids_high_up)
+
+#high_down#
+entrez_ids_high_down <- mapIds(
+  org.Mm.eg.db,
+  keys = genesymbols_high_down,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+entrez_ids_high_down <- na.omit(entrez_ids_high_down)
+
+## write mapped genes, in case not all are mapped, e mandar o .csv para a pasta desejada ####
+ write.csv(entrez_ids_high_all, "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_high_all_genes_kegg.csv")
+ write.csv(entrez_ids_high_up , "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_high_up_genes_kegg.csv")
+ write.csv(entrez_ids_high_down, "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_high_down_genes_kegg.csv")
+
+### LOW — ALL
+low_all <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  abs(sig_low_clean$log2FoldChange) > 1
+]
+
+### LOW — UP
+low_up <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  sig_low_clean$log2FoldChange > 1
+]
+
+### LOW — DOWN
+low_down <- sig_low_clean$symbol[
+  sig_low_clean$padj < 0.05 &
+  sig_low_clean$log2FoldChange < -1
+]
+
+### Mapear SYMBOL → ENTREZID
+entrez_low_all <- mapIds(
+  org.Mm.eg.db,
+  keys = low_all,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+entrez_low_up <- mapIds(
+  org.Mm.eg.db,
+  keys = low_up,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+entrez_low_down <- mapIds(
+  org.Mm.eg.db,
+  keys = low_down,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+### Criar data.frame com duas colunas SEMPRE
+make_df <- function(symbols, entrez) {
+  data.frame(
+    SYMBOL   = symbols,
+    ENTREZID = as.character(entrez[symbols]),
+    stringsAsFactors = FALSE
+  )
+}
+
+df_low_all  <- make_df(low_all,  entrez_low_all)
+df_low_up   <- make_df(low_up,   entrez_low_up)
+df_low_down <- make_df(low_down, entrez_low_down)
+
+### Remover genes sem ENTREZID (opcional)
+df_low_all  <- df_low_all[!is.na(df_low_all$ENTREZID), ]
+df_low_up   <- df_low_up[!is.na(df_low_up$ENTREZID), ]
+df_low_down <- df_low_down[!is.na(df_low_down$ENTREZID), ]
+
+### Salvar CSVs
+write.csv(df_low_all,
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_all_genes_kegg.csv",
+  row.names = FALSE)
+
+write.csv(df_low_up,
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_up_genes_kegg.csv",
+  row.names = FALSE)
+
+write.csv(df_low_down,
+  "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_down_genes_kegg.csv",
+  row.names = FALSE)
+
+
+## write mapped genes, in case not all are mapped, e mandar o .csv para a pasta desejada ####
+ write.csv(entrez_ids_low_all, "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_all_genes_kegg.csv")
+ write.csv(entrez_ids_low_up, "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_up_genes_kegg.csv")
+ write.csv(entrez_ids_low_down, "/group/sbms006/rrubimsilvadocouto/NovaSeq_Data/gene-counts-S637-S633/muscle2/muscle_low_down_genes_kegg.csv")
+
+
+######## perform KEGG enrichment analysis ## RPT RPT RPT ####
+kegg_enrichment <- enrichKEGG(
+    gene            = entrez_ids,     # use entrez ids
+    organism        = "mmu",          # mouse
+    pvalueCutoff    = 0.1,            # adjusted p-value cutoff
+    qvalueCutoff    = 1               # q-value cutoff
+)
+
+# save results and send to desired folder 
+
+write.csv(
+    as.data.frame(kegg_enrichment),
+    "/group/sbms006/rrubimsilvadocouto/KEGG_analysis/muscle/muscle_10_common_up_genes_kegg_enrichment_results.csv",
+    row.names = FALSE # to remove first column
+)
+
+# visualize results 
+
+
+pdf(
+    file = "/group/sbms006/rrubimsilvadocouto/KEGG_analysis/muscle/muscle_10_common_up_genes_kegg_enrichment_results.pdf",
+    width = 12,
+    height = 8
+)
+
+barplot(
+    kegg_enrichment,
+    showCategory = 20,
+    title = "Top Up-regulated Muscle Genes KEGG Pathways"
+)
+
+dev.off()
+
+
+
